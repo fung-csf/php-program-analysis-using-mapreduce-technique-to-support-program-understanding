@@ -1,0 +1,559 @@
+
+import org.apache.spark.sql.{DataFrame, Dataset, SparkSession,Column}
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types._
+import scala.util.matching.Regex
+import sqlContext.implicits._
+import java.util.regex.Pattern
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.functions.row_number
+import scala.collection.mutable.ArrayBuffer
+
+
+import scalaj.http._
+import scala.util.parsing.json._
+import spray.json._
+import java.util.Base64
+import java.nio.charset.StandardCharsets
+
+//User Defined function to produce comma seperated strings
+
+//public function setProperties($properties = array())      public,function,setProperties,properties,array
+
+def toExtract(str: String, patternString: String) = {      
+  val pattern = Pattern.compile(patternString)
+  val tmplist = scala.collection.mutable.ListBuffer.empty[String]
+  val matcher = pattern.matcher(str)
+  while (matcher.find()) {
+    tmplist += matcher.group()     
+  }
+  tmplist.mkString(",")
+}     
+
+val Extract = udf(toExtract _)
+
+
+// HTTP GET REQUEST FROM AIRTABLE API
+val response = Http("https://v1.nocodeapi.com/testfypver1/airtable/ebdJjhwHBlWWLCbC?tableName=file&fields=Name,content").asString
+
+  val fileContent =  response.body;
+
+
+val readDataFrame = Seq(
+  ("temp")  
+).toDF("word")
+
+val readDataFrame1 = readDataFrame.withColumn("content", lit(fileContent));
+
+val readDataFrame2 = readDataFrame1.withColumn("base64", regexp_extract(col("content"), ".content.:.(.*).},", 1)).drop(col("content")).drop(col("word"))
+// readDataFrame2.show(false)
+
+
+val fileContentBase64 = readDataFrame2.select("base64").collect().map(_.getString(0)).mkString("");
+
+val decodedByteArray = Base64.getDecoder().decode(fileContentBase64);
+
+val fileContentString = new String(decodedByteArray, StandardCharsets.UTF_8);
+
+// OVERWRITE the content in test.txt if it has any content. Else, write to test.txt with the content of the file  from Airtable through HTTP GET Request
+dbutils.fs.put("dbfs:/FileStore/tables/test.txt", fileContentString, true)
+
+
+
+
+ val RDD = sc.textFile("/FileStore/tables/test.txt");
+
+
+
+//trim whitespace
+ val dftempt:DataFrame = RDD.toDF("row").select(trim(col("row")).as("row"))
+
+    ////SET 1
+     val df:DataFrame = dftempt.withColumn("ID", monotonically_increasing_id)  //ADD ID  to each record
+//      df.show(false)
+
+
+val phpIdentitifer = "[a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*"  // matches a php identifier, thus will remove all special characters
+
+
+////////////////////////////extract class name////////////////////
+
+val classNametemp = df.filter(col("row").rlike("^class [a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*|(public|private|protected|final)\\s+class [a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*")).select(Extract(col("row"), lit(phpIdentitifer)).as("row"))
+// classNametemp.show(false)
+val className = classNametemp.withColumn("class", regexp_extract(col("row"), "class,([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)", 1)).drop(col("row"))
+
+//   className.show(false)
+
+val classNameString = className.select("class").collect().map(_.getString(0)).mkString("")
+
+
+
+// ///////////////////////extract namespace////////////////////////////
+
+val nameSpaceTemp = df.filter(col("row").rlike("^namespace .*;$")).select(Extract(col("row"), lit(phpIdentitifer)).as("row"))
+
+ val  nameSpaceRemoveKeywords = nameSpaceTemp.withColumn("remove", regexp_replace(col("row"),"namespace,", "" )).drop(col("row"))
+
+   val namespace = nameSpaceRemoveKeywords.withColumn("namespace", regexp_replace(col("remove"), "," ,"/")).drop(col("remove"))
+     
+//    namespace.show(false)
+
+   val nameSpaceString = namespace.select("namespace").collect().map(_.getString(0)).mkString("")
+  
+
+////////////////////////extract functions//////////////////////
+
+
+  val functionNameTemp = df.filter(col("row").rlike("(public|private|protected) function.*\\(")).select(Extract(col("row"), lit(phpIdentitifer)).as("row"))
+//   functionNameTemp.show(false)
+
+  
+val functionName = functionNameTemp.withColumn("id", regexp_extract(col("row"), "function,([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)", 1)).drop(col("row")).withColumn("comboId", lit(classNameString))
+
+// functionName.show(false)
+
+
+  
+
+
+
+
+/////////////////// external dependency/////////////////////
+
+//regular expression
+val externalDependencyRE = "(^\\s{0,1}require_once|^\\s{0,1}require|^\\s{0,1}include|^\\s{0,1}include_once|^\\s{0,1}use) .*;$"
+
+
+  val externalDependencyTemp = df.filter(col("row").rlike(externalDependencyRE)).filter(!col("row").rlike("^\\s{0,1}use function")).select(Extract(col("row"), lit(phpIdentitifer)).as("row"))
+
+//   externalDependencyTemp.show(false)
+
+ val  removeKeyword = externalDependencyTemp.withColumn("remove", regexp_replace(col("row"),"(require_once,|require,|include,|include_once,|,php|use,)", "" )).drop(col("row"))
+
+   val translate = removeKeyword.withColumn("row", regexp_replace(col("remove"), "," ,"/")).drop(col("remove"))
+     
+// translate.show(false)
+
+
+val externalDependency = translate.withColumn("class",  lit(s"$classNameString")).withColumn( "external dependency", concat(col("row"), lit(".php"))).drop(col("row"))  
+
+// externalDependency.show(false)
+
+
+     
+// // // // // ///////////////////////Class-level dependency////////////////////////////
+
+
+val classLevel1 = externalDependency.withColumn("Class-level dependency", regexp_replace(col("external dependency"), "\\w+/" ,"")).drop(col("external dependency"))
+
+
+val classLevel2 = df.withColumn("class",  lit(s"$classNameString")).withColumn("Class-level dependency", when(col("row").rlike("([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)::[a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*\\(.*\\)"), regexp_extract(col("row"), "([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)::[a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*\\(.*\\)", 1)).when(col("row").rlike("([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)::[a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*"), regexp_extract(col("row"), "([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)::[a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*", 1))).select(col("Class-level dependency"), concat(col("Class-level dependency"), lit(".php")) ).drop(col("row")).drop(col("ID"))
+         
+                            
+                                      
+   val classLevel3 =  classLevel1.union(classLevel2)      
+
+val classLevel = classLevel3.filter(!col("Class-level dependency").rlike("^null$|^parent.php$|^self.php$|^static.php$")).distinct().withColumn("class",  lit(s"$classNameString"))
+
+
+
+
+
+// // //////////////////////////Package-level dependency/////////////////////////
+
+
+val packageLevel = externalDependency.withColumn("nameSpace",  lit(s"$nameSpaceString")).withColumn("Package-level dependency", regexp_replace(col("external dependency"), "/\\w+.\\w+$" ,"")).drop(col("external dependency")).drop(col("class")).distinct()
+
+
+
+
+
+
+// // // // // ///////////////////////inheritance dependency////////////////////////////
+
+
+ val InheritanceRE = "^class [a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]* (extends|implements)|(public|private|protected|final)\\s+class [a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]* (extends|implements)"
+
+  val inheritanceDependencyTemp = df.filter(col("row").rlike(InheritanceRE)).select(Extract(col("row"),lit(phpIdentitifer)).as("row"))
+
+//   inheritanceDependencyTemp.show(false)
+
+  val  removeKeywords = inheritanceDependencyTemp.withColumn("remove", regexp_replace(col("row"),"(extends,|implements,|class,|private,|public,|final,)", "" )).drop(col("row"))
+
+//    removeKeywords.show(false)
+
+val arrayTypeTransform = removeKeywords.select(split(col("remove"),",").as("row"))
+
+// arrayTypeTransform.show(false)
+
+val inheritanceDependency = arrayTypeTransform.select(explode(col("row")).as("inheritance dependency")).withColumn("Class",  lit(s"$classNameString"))
+
+//   inheritanceDependency.show(false)
+
+val removeClassName= inheritanceDependency.where(!col("inheritance dependency").contains(lit(s"$classNameString")))
+
+// removeClassName.show(false)
+
+
+
+
+
+// // //////////////////function level dependency ( functions within a class) //////////////////
+
+
+
+
+
+ ////SET 2
+   val dftempt1 = dftempt.withColumn("new_column",lit("ABC"))
+  @transient val w = Window.partitionBy("new_column").orderBy(lit('A'))
+ @transient  val dataFrame = dftempt1.withColumn("ID", row_number().over(w)).drop("new_column")   //ADD ID to each row in order to extract functions
+//     dataFrame.show(false)
+  dataFrame.createOrReplaceTempView("dataFrameTable")
+
+val functions =  dataFrame.filter(col("row").rlike("(public|private|protected) function.*\\("))
+//     functions.show(false)
+  
+val numOfFunctionRecords = functions.count().toInt
+val totalNumOfRecords   = dataFrame.count().toInt
+
+
+val  functionID = functions.select("ID").collect.map(_.getInt(0))
+
+
+
+
+
+val seqOfFunctionDF: Seq[DataFrame] = (0 to (numOfFunctionRecords - 1)).map { i =>
+  
+  
+  if(i < (numOfFunctionRecords - 1) ) {
+   
+      val query = "SELECT row AS dependency FROM dataFrameTable WHERE ID between " + functionID(i) + " AND " + (functionID(i + 1) - 1) 
+      spark.sql(query)
+     
+   }
+   else {
+       val query = "SELECT row AS dependency FROM dataFrameTable WHERE ID between " + functionID(i) + " AND " + (totalNumOfRecords - 1) 
+       spark.sql(query)
+   }
+  
+}
+   val arrayOfFunctionDFtemp =  seqOfFunctionDF.toArray  // Array of function DataFrames
+
+     // arrayOfFunctionDFtemp(numOfFunctionRecords - 1).show(false)
+
+ //To clean out excess rows in dataframe
+  val seqOfCleanedFunctionDF: Seq[DataFrame] = (0 to (numOfFunctionRecords - 1)).map { i =>
+    
+             
+         val df =  arrayOfFunctionDFtemp(i)
+    
+              val dff1 = df.withColumn("new_column",lit("ABC"))
+    @transient val windows = Window.partitionBy("new_column").orderBy(lit('A'))
+    @transient  val dff2 = dff1.withColumn("ID", row_number().over(windows)).drop("new_column")   //ADD ID to record
+    
+        val dff3 = dff2.filter(col("dependency").rlike("}"))
+      
+    
+    var finaldff = spark.emptyDataFrame
+    
+    if(!dff3.head(1).isEmpty) {      // ensure that it is  a function with a function body
+      
+        dff3.createOrReplaceTempView("functionDataFrameTable")
+    val dff4 = spark.sql("SELECT MAX(ID) AS ID FROM functionDataFrameTable")
+    
+    val rowNumber = dff4.select("ID").collect().map(_.getInt(0))  // return  Array[int]
+
+       finaldff = dff2.select(col("dependency")).filter(   col("ID").between(1,rowNumber(0)))
+      
+    }
+    
+    
+    
+    if(dff3.head(1).isEmpty) {      // ensure that it is  a function without a function body
+       finaldff = df
+    }
+    
+    finaldff   //return finaldff
+
+  }
+
+  val arrayOfCleanedFunctionDFtemp =  seqOfCleanedFunctionDF.toArray 
+
+  //arrayOfCleanedFunctionDFtemp(5).show(false)
+
+
+  val seqOfFunctionDependencyDF: Seq[DataFrame] = (0 to (numOfFunctionRecords - 1)).map { i =>
+        
+          val df = arrayOfCleanedFunctionDFtemp(i)
+
+        val functionNametemp = df.filter(col("dependency").rlike("(public|private|protected) function.*\\("))
+
+     val functionName = functionNametemp.withColumn("function", regexp_extract(col("dependency"), "function ([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)", 1)).drop(col("dependency"))
+
+    val functionNameString = functionName.select("function").collect().map(_.getString(0)).mkString("")
+    
+      val dfFinal = df.withColumn("source", lit(functionNameString)).filter(col("dependency").rlike("->([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*\\)|[a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*::([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*\\)|new\\W+([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*|->.*\\W+([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*\\)|([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*"))
+          
+    
+//     val dfFinal1 =  dfFinal.filter(!col("dependency").rlike("""function|^".*"$|\\/\\/|^\\*"""))
+    val dfFinal1 =  dfFinal.filter(!col("dependency").rlike("""function|^".*"$|\\/\\/"""))
+     
+      
+     val finaldf = dfFinal1.withColumn("temp", when(col("dependency").rlike("->([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*\\)"), regexp_extract(col("dependency"), "->([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*\\)", 1)).when(col("dependency").rlike("[a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*::([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*\\)"), regexp_extract(col("dependency"), "[a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*::([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*\\)", 1)).when(col("dependency").rlike("new\\W+([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*"),regexp_extract(col("dependency"), "new\\W+([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*", 1) ).when(col("dependency").rlike("->.*\\W+([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*\\)"), regexp_extract(col("dependency"), "->.*\\W+([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*\\)", 1) )).withColumn( "target", col("temp")).drop(col("temp"))
+    
+            
+    val finaldf1 =  dfFinal1.withColumn("temp", when(col("dependency").rlike("([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*"), regexp_extract(col("dependency"), "([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*", 1))).withColumn( "target", col("temp")).drop(col("temp"))
+    
+    
+val dependencyString = dfFinal1.filter(col("dependency").rlike("->([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(.*\\)"))
+
+.select("dependency").collect().map(_.getString(0)).mkString("")
+    
+    
+      val  dependencyArray = dependencyString.split("->").filter( x => x.contains("(") )
+
+
+  val dependencydf = sc.parallelize(dependencyArray).toDF("temp")
+  val  dependencydf1 = dependencydf.withColumn("dependency", lit("null")).withColumn("source", lit(functionNameString)).withColumn("target", when(col("temp").rlike("([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\("), regexp_extract(col("temp"), "([a-zA-Z_\\x7f-\\xff][a-zA-Z0-9_\\x7f-\\xff]*)\\(", 1))).drop(col("temp"))
+    
+    
+    val newfinaldf =  finaldf.union(finaldf1).union(dependencydf1).distinct();
+   
+    
+     val outputResult = newfinaldf.filter(!col("target").rlike("^null$"))
+    
+//     finaldf   //return finaldff
+    
+//    finaldf1
+    
+    outputResult;
+  
+  }
+
+
+      val arrayOfFunctionNameDFTemp =  seqOfFunctionDependencyDF.toArray
+
+
+
+      
+
+
+
+//////////  JSON formatting /////////////
+
+
+
+  val edgesDFtemp = arrayOfFunctionNameDFTemp.reduce(_ union _)
+
+
+        val edgesDF  = edgesDFtemp.select(col("source"), col("target") )
+
+
+       val functionNameId = functionName.select(col("id"))
+
+//     functionNameId.show(false)
+
+val nodetemp = edgesDF.select(col("source").alias("id")).union(edgesDF.select(col("target").alias("id")))
+
+  val NodeName1 = nodetemp.select("id").collect().map(_.getString(0)).mkString(",")
+
+
+  val NodeName2  =  functionNameId.select("id").collect().map(_.getString(0)).mkString(",")
+
+   val  nodesString  =  NodeName1 + "," + NodeName2;
+
+   val nodeArrayTemp = nodesString.split(",")
+ 
+   val nodeArray = nodeArrayTemp.distinct
+
+ println(nodeArray)   
+
+ val nodesDF = spark.createDataFrame(nodeArray.map(Tuple1(_))).withColumnRenamed("_1","id").withColumn("comboId", lit(classNameString))
+  
+
+ val nodes = nodesDF.toJSON.collect.mkString(",")
+
+
+ val edges = edgesDF.toJSON.collect.mkString(",")
+
+
+
+////////////////////////////////Functional Dependency//////////////////////////////////
+
+  val classNameStringFunc = classNameString;
+  val packageNameStringFunc =  nameSpaceString;
+
+
+   val nodesStringFunc =  f"""[ $nodes%s] """
+  val edgesStringFunc =   f"""[ $edges%s ] """
+
+// println(nodesStringFunc)
+// println(edgesStringFunc)
+
+    val combosStringFunc  = f"""[ {"id": "$classNameStringFunc%s", "label": "$classNameStringFunc%s", "parentId": "$packageNameStringFunc%s"}, { "id": "$packageNameStringFunc%s", "label": "$packageNameStringFunc%s", "parentId": null} ] """
+
+   val functionalDependencyGraph = f""" {   "nodes": $nodesStringFunc%s,  "combos": $combosStringFunc%s,   "edges": $edgesStringFunc%s  }  """
+
+   
+    
+    
+     
+  
+
+
+
+//////////////////// Class-level dependency//////////////////////
+val someDF = Seq((classNameString)).toDF("id")
+val  someDF2 = classLevel.select(col("Class-level dependency").alias("id"))
+val  someDF3 = removeClassName.select(col("inheritance dependency").alias("id"))
+
+   val nodesString1 =  someDF.union(someDF2).union(someDF3).toJSON.collect.mkString(",")
+
+   val nodesStringClass =  f"""[ $nodesString1%s] """
+
+
+val  someDF4 = classLevel.select(col("class").alias("source"), col("Class-level dependency").alias("target"))
+val  someDF5 = removeClassName.select(col("class").alias("source"), col("inheritance dependency").alias("target"))
+  val  edgesString1  = someDF4.union(someDF5).toJSON.collect.mkString(",")   
+        
+                                      
+     val edgesStringClass =   f"""[ $edgesString1%s ] """     
+
+val classDependencyGraph = f""" {   "nodes": $nodesStringClass%s, "edges": $edgesStringClass%s  }  """
+
+
+
+
+
+
+//////////////////// Package-level dependency///////////////////////
+                                      
+
+val someDF6 = Seq((nameSpaceString)).toDF("id")
+val  someDF7 = packageLevel.select(col("Package-level dependency").alias("id"))
+val nodesString2 =  someDF6.union(someDF7).toJSON.collect.mkString(",")
+
+val nodesStringPackage =  f"""[ $nodesString2%s] """
+
+   val edgesString2 =    packageLevel.select(col("nameSpace").alias("source"), col("Package-level dependency").alias("target")).toJSON.collect.mkString(",") 
+
+  val edgesStringPackage=   f"""[ $edgesString2%s ] """
+
+val packageDependencyGraph = f""" {   "nodes": $nodesStringPackage%s, "edges": $edgesStringPackage%s  }  """
+
+
+  
+
+
+///////////////////////////Source Code Metrics////////////////////
+
+val publicFunctionCount = RDD.filter(!_.contains("/*")).filter(!_.contains("//")).filter(f=> f.contains("public")).filter(a=> a.contains("(")).filter(b=> b.contains(")")).filter(c=>c.contains("function")).collect
+  val privateFunctionCount = RDD.filter(!_.contains("/*")).filter(!_.contains("//")).filter(f=> f.contains("private")).filter(a=> a.contains("(")).filter(b=> b.contains(")")).filter(c=>c.contains("function")).collect
+  val protectedFunctionCount = RDD.filter(!_.contains("/*")).filter(!_.contains("//")).filter(f=> f.contains("protected")).filter(a=> a.contains("(")).filter(b=> b.contains(")")).filter(c=>c.contains("function")).collect
+  val functionCount = publicFunctionCount ++ privateFunctionCount ++ protectedFunctionCount
+
+
+ val noOfFunction = functionCount.size.toString;
+// println(functionCount.size)
+
+
+  val totalLinesOfCode = RDD.count().toString 
+// println(totalLinesOfCode)
+
+ 
+    val noOfClassDependency =  classLevel.count().toString
+// println(noOfClassDependency)
+
+    val noOfPackageDependency =  packageLevel.count().toString
+// println(noOfPackageDependency)
+
+                   
+
+  val importlibrariesCount = RDD.filter(!_.contains("/*")).filter(!_.contains("//")).filter(a=> a.contains("use")).filter(b=> b.contains(";")).collect
+  
+    val noOfimportLibraries   =  importlibrariesCount.size.toString;
+// println(noOfimportLibraries)
+
+val objectInstanceCount = RDD.filter(!_.contains("/*")).filter(!_.contains("//")).filter(a=> a.contains("new")).filter(a=> a.contains("(")).filter(b=> b.contains(";")).collect
+
+
+val noOfobjectInstance   =  objectInstanceCount.size.toString;
+// println(objectInstanceCount.size)
+
+
+
+
+
+
+///////////////////////HTTP  POST REQUEST TO AIRTABLE//////////////////////////////////
+
+
+
+def postRequestUrl(url: String, requestJson: String) = {
+    val httpRequest = Http(url)
+      .header("Content-Type", "application/json")//"application/json"
+      .header("Charset", "UTF-8")
+      .option(HttpOptions.readTimeout(10000))
+    val response = (requestJson != null && !requestJson.isEmpty) match {
+      case true =>  httpRequest.postData(requestJson).asString
+      case false => httpRequest.asString
+    }
+
+    response.body
+  }
+
+
+
+//[{ Name: fileData.name, content: fileDataContent }]
+
+val HttpPostURL = "https://v1.nocodeapi.com/testfypver1/airtable/ebdJjhwHBlWWLCbC?tableName=result"
+
+
+val Name =  classNameString + ".php";
+ val NameBytes = Name.getBytes(StandardCharsets.UTF_8);
+val  NameBase64 =  Base64.getEncoder().encodeToString(NameBytes);
+
+
+ val functionalDependencyGraphBytes = functionalDependencyGraph.getBytes(StandardCharsets.UTF_8);
+val  functionalDependencyGraphBase64 =  Base64.getEncoder().encodeToString(functionalDependencyGraphBytes);
+
+ val classDependencyGraphBytes = classDependencyGraph.getBytes(StandardCharsets.UTF_8);
+val  classDependencyGraphBase64 =  Base64.getEncoder().encodeToString(classDependencyGraphBytes);
+
+ val packageDependencyGraphBytes = packageDependencyGraph.getBytes(StandardCharsets.UTF_8);
+val  packageDependencyGraphBase64 =  Base64.getEncoder().encodeToString(packageDependencyGraphBytes);
+
+ val noOfFunctionBytes = noOfFunction.getBytes(StandardCharsets.UTF_8);
+val  noOfFunctionBase64 =  Base64.getEncoder().encodeToString(noOfFunctionBytes);
+
+val totalLinesOfCodeBytes = totalLinesOfCode.getBytes(StandardCharsets.UTF_8);
+val  totalLinesOfCodeBase64 =  Base64.getEncoder().encodeToString(totalLinesOfCodeBytes);
+
+val noOfClassDependencyBytes = noOfClassDependency.getBytes(StandardCharsets.UTF_8);
+val  noOfClassDependencyBase64 =  Base64.getEncoder().encodeToString(noOfClassDependencyBytes);
+
+val noOfPackageDependencyBytes = noOfPackageDependency.getBytes(StandardCharsets.UTF_8);
+val  noOfPackageDependencyBase64 =  Base64.getEncoder().encodeToString(noOfPackageDependencyBytes);
+
+
+val noOfimportLibrariesBytes = noOfimportLibraries.getBytes(StandardCharsets.UTF_8);
+val  noOfimportLibrariesBase64 =  Base64.getEncoder().encodeToString(noOfimportLibrariesBytes);
+
+
+
+val noOfobjectInstanceBytes = noOfobjectInstance.getBytes(StandardCharsets.UTF_8);
+val  noOfobjectInstanceBase64 =  Base64.getEncoder().encodeToString(noOfobjectInstanceBytes);
+
+
+val postRequestData =   f""" [{  "Name": "$NameBase64%s", "functionalDependencyGraph": "$functionalDependencyGraphBase64%s", "classDependencyGraph": "$classDependencyGraphBase64%s", "packageDependencyGraph": "$packageDependencyGraphBase64%s",  "noOfFunction": "$noOfFunctionBase64%s", "totalLinesOfCode": "$totalLinesOfCodeBase64%s", "noOfClassDependency": "$noOfClassDependencyBase64%s", "noOfPackageDependency": "$noOfPackageDependencyBase64%s", "noOfimportLibraries": "$noOfimportLibrariesBase64%s", "noOfobjectInstance": "$noOfobjectInstanceBase64%s", "fileContent": "$fileContentBase64%s" } ]"""
+
+
+
+
+
+val postResponseBody = postRequestUrl(HttpPostURL, postRequestData);
+
+
+
